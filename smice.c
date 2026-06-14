@@ -28,6 +28,16 @@
 #define DEVICE_NAME_SIZE 128 /* Maximum number of character in a device name */
 #define EVENT_BUFFER_SIZE 64 /* Maximum number of events int the buffer */
 
+/* Number of bits in a single unsigned long integer */
+#define BITS_PER_LONG (sizeof(unsigned long) * 8)
+
+/* Determine the number of unsigned long elements required to hold 'x' bits */
+#define NBITS(x) (((x) - 1)/BITS_PER_LONG+1)
+
+/* Return 1 if the specified 'bit' is set in the 'array', 0 otherwise */
+#define TEST_BIT(bit, array) \
+    ((array[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1)
+
 /* Represent an active device in the evdev */
 struct dev {
     char name[DEVICE_NAME_SIZE]; /* Name of the device */
@@ -56,17 +66,17 @@ void sigHandler(int signum) {
     running = 0;
 }
 
-/* Search for all the registered mouse devices in the system and fills the 
- * `devices` array for each of them.
- * The search ends when no more new mice are found or when 'max_mice' mice 
- * have been found.
- * Return the number of mice device found. 
+/* Search for all the registered pointinga devices (mice, trackpads, tablets) 
+ * and fills the `devices` array for each of them.
+ * The search ends when no more new devices are found or when 'max_devices' 
+ * devices have been found.
+ * Return the number of devices found or -1 if an error occurs.
  * It's up to the caller to close the open file descriptors. */
-int getMouseDevices(struct dev *devices, int max_mice) {
+int getPointerDevices(struct dev *devices, int max_devices) {
     FILE *fp = fopen(DEVICE_INPUT_PATH, "r");
     if (fp == NULL) {
         perror("Failed to open " DEVICE_INPUT_PATH);
-        return 0;
+        return -1;
     }
 
     /* Read the devices file to search for the following pattern:
@@ -77,7 +87,7 @@ int getMouseDevices(struct dev *devices, int max_mice) {
     char line[512];
     int count = 0;
     char devname[DEVICE_NAME_SIZE];
-    while (fgets(line, sizeof(line), fp) && count < max_mice) {
+    while (fgets(line, sizeof(line), fp) && count < max_devices) {
         if (strncmp(line, "N: Name=\"", 9) == 0) {
             strncpy(devname, line+9, sizeof(devname));
             devname[sizeof(devname)-1] = '\0'; 
@@ -88,16 +98,10 @@ int getMouseDevices(struct dev *devices, int max_mice) {
             else if ((c = strchr(devname, '\n')) != NULL) *c = '\0';
         }
 
-        if (strncmp(line, "H: Handlers=", 12) == 0 &&
-            strstr(line, "mouse") != NULL) {
+        if (strncmp(line, "H: Handlers=", 12) == 0) {
             char *evstr = strstr(line, "event");
             if (evstr != NULL) {
-                struct dev *device = &devices[count];
-                strncpy(device->name, devname, sizeof(device->name));
-                device->name[sizeof(device->name)-1] = '\0';
-                devname[0] = '\0';
-
-                /* Get the file descriptor of the event handler file */
+                /* Get the event handler file of the device */
                 int evnum = atoi(evstr+5);
                 char event_path[64];
                 snprintf(event_path, sizeof(event_path), "%sevent%d", 
@@ -106,9 +110,51 @@ int getMouseDevices(struct dev *devices, int max_mice) {
                 int fd;
                 if ((fd = open(event_path, O_RDONLY | O_NONBLOCK)) == -1) {
                     error(0, errno, "Failed to open %s", event_path);
+                    goto efile_err;
+                }
+
+                /* Query the device capabilities to check if it's a cursor
+                 * controller */
+                unsigned long ev_bits[NBITS(EV_MAX)] = {0};
+                int is_pointer = 0;
+
+                if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) == -1) {
+                    perror("ioctl EVIOCGBIT failed");
+                    goto efile_err;
+                }
+
+                /* Check for relative pointer */
+                if (TEST_BIT(EV_REL, ev_bits)) {
+                    unsigned long rel_bits[NBITS(REL_MAX)] = {0};
+                    ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel_bits)),
+                            rel_bits);
+                    if (TEST_BIT(REL_X, rel_bits) && 
+                            TEST_BIT(REL_Y, rel_bits)) {
+                        is_pointer = 1;
+                    }
+                }
+                /* Check for absolute pointer */
+                if (!is_pointer && TEST_BIT(EV_ABS, ev_bits)) {
+                    unsigned long abs_bits[NBITS(ABS_MAX)] = {0};
+                    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)),
+                            abs_bits);
+                    if (TEST_BIT(ABS_X, abs_bits) && 
+                            TEST_BIT(ABS_Y, abs_bits)) {
+                        is_pointer = 1;
+                    }
+                }
+
+                if (!is_pointer) {
+                    devname[0] = '\0';
+                    close(fd);
                     continue;
                 }
+
+                struct dev *device = &devices[count];
+                strncpy(device->name, devname, sizeof(device->name));
+                device->name[sizeof(device->name)-1] = '\0';
                 device->fd = fd;
+                devname[0] = '\0';
 
                 count++;
             }
@@ -117,57 +163,109 @@ int getMouseDevices(struct dev *devices, int max_mice) {
 
     fclose(fp);
     return count;
+
+efile_err:
+    for (int j = 0; j < count; j++) {
+        close(devices[j].fd);
+    }
+
+    return -1;
 }
 
-/* Create 'count' virtual mice.
+/* Create 'count' virtual devices that clone the capabilities of the 
+ * 'count' 'src_devices'.
  * Return 1 on success, 0 otherwise.
- * It's up to the caller to destroy the virtual devices and close the 
- * open file descriptors. */
-int createVirtualMice(struct dev *devices, int count) {
+ * It's up to the caller to destroy the created virtual devices. */
+int createVirtualDevices(struct dev *dst_devices, struct dev *src_devices, 
+                         int count) 
+{
     struct uinput_setup usetup;
 
     int i;
     for (i = 0; i < count; i++) {
+        int src_fd = src_devices[i].fd;
         int fd = open(VIRTUAL_DEVICE_PATH, O_WRONLY | O_NONBLOCK);
         if (fd == -1) {
             perror("Failed to open " VIRTUAL_DEVICE_PATH);
-            goto vmice_err;
+            goto vdev_err;
         }
 
-        /* Enable mouse button */
-        ioctl(fd, UI_SET_EVBIT,  EV_KEY);
-        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
-        ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
-        ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE);
+        /* Fetch main event types supported by the physical hardware */
+        unsigned long ev_bits[NBITS(EV_MAX)] = {0};
+        if (ioctl(src_fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) == -1) {
+            perror("ioctl EVIOCGBIT failed");
+            close(fd);
+            goto vdev_err;
+        }
 
-        /* Enable mouse relative movement axes */
-        ioctl(fd, UI_SET_EVBIT,  EV_REL);
-        ioctl(fd, UI_SET_RELBIT, REL_X);
-        ioctl(fd, UI_SET_RELBIT, REL_Y);
-        ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
+        /* Clone buttons and keys */
+        if (TEST_BIT(EV_KEY, ev_bits)) {
+            ioctl(fd, UI_SET_EVBIT, EV_KEY);
+            unsigned long key_bits[NBITS(KEY_MAX)] = {0};
+            ioctl(src_fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+            for (int k = 0; k < KEY_MAX; k++) {
+                if (TEST_BIT(k, key_bits)) {
+                    ioctl(fd, UI_SET_KEYBIT, k);
+                }
+            }
+        }
+
+        /* Clone relative axis */
+        if (TEST_BIT(EV_REL, ev_bits)) {
+            ioctl(fd, UI_SET_EVBIT, EV_REL);
+            unsigned long rel_bits[NBITS(REL_MAX)] = {0};
+            ioctl(src_fd, EVIOCGBIT(EV_REL, sizeof(rel_bits)), rel_bits);
+            for (int r = 0; r < REL_MAX; r++) {
+                if (TEST_BIT(r, rel_bits)) {
+                    ioctl(fd, UI_SET_RELBIT, r);
+                }
+            }
+        }
+
+        /* Clone absolute axis */
+        if (TEST_BIT(EV_ABS, ev_bits)) {
+            ioctl(fd, UI_SET_EVBIT, EV_ABS);
+            unsigned long abs_bits[NBITS(ABS_MAX)] = {0};
+            ioctl(src_fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits);
+            for (int a = 0; a < ABS_MAX; a++) {
+                if (TEST_BIT(a, abs_bits)) {
+                    ioctl(fd, UI_SET_ABSBIT, a);
+
+                    /* Important: Absolute devices must sync dimensions 
+                     * with the kernel */
+                    struct uinput_abs_setup abs_setup;
+                    memset(&abs_setup, 0, sizeof(abs_setup));
+                    abs_setup.code = a;
+                    if (ioctl(src_fd, EVIOCGABS(a), &abs_setup.absinfo) >= 0) {
+                        ioctl(fd, UI_ABS_SETUP, &abs_setup);
+                    }
+                }
+            }
+        }
 
         /* Configure device properties */
         memset(&usetup, 0, sizeof(usetup));
         usetup.id.bustype = BUS_USB;
         usetup.id.vendor  = 0xCAFE;      /* sample vendor ID */
         usetup.id.product = 0x0001 + i; /* unique product ID */
-        snprintf(usetup.name, sizeof(usetup.name), "Smice Mouse %d", i);
+        snprintf(usetup.name, sizeof(usetup.name), 
+                 "Smice Virtual Device %d", i);
 
         if (ioctl(fd, UI_DEV_SETUP, &usetup) == -1) {
             perror("ioctl UI_DEV_SETUP failed");
             close(fd);
-            goto vmice_err;
+            goto vdev_err;
         }
 
         if (ioctl(fd, UI_DEV_CREATE) == -1) {
             perror("ioctl UI_DEV_CREATE failed");
             close(fd);
-            goto vmice_err;
+            goto vdev_err;
         }
 
-        strncpy(devices[i].name, usetup.name, sizeof(devices[i].name));
-        devices[i].name[sizeof(devices[i].name)-1] = '\0';
-        devices[i].fd = fd;
+        strncpy(dst_devices[i].name, usetup.name, sizeof(dst_devices[i].name));
+        dst_devices[i].name[sizeof(dst_devices[i].name)-1] = '\0';
+        dst_devices[i].fd = fd;
     }
 
    /* On UI_DEV_CREATE the kernel will create the device node for this
@@ -178,10 +276,10 @@ int createVirtualMice(struct dev *devices, int count) {
     usleep(100000);
     return 1;
 
-vmice_err:
+vdev_err:
     for (int j = 0; j < i; j++) {
-        ioctl(devices[j].fd, UI_DEV_DESTROY);
-        close(devices[j].fd);
+        ioctl(dst_devices[j].fd, UI_DEV_DESTROY);
+        close(dst_devices[j].fd);
     }
 
    return 0;
@@ -273,13 +371,15 @@ int main(int argc, char **argv) {
     }
 
     errno = 0;
-    int mouse_count = getMouseDevices(smice.phy_devices, MAX_DEVICES);
-    if (errno == EACCES) {
-        fprintf(stderr, "Since %s files are proteced for security "
-                "reasons, run the program again with `sudo`\n", 
-                DEVICE_EVENT_PATH);
-        return 1;
-    } else if (mouse_count == 0) {
+    int device_count = getPointerDevices(smice.phy_devices, MAX_DEVICES);
+    if (device_count == -1) {
+        if (errno == EACCES) {
+            fprintf(stderr, "Since %s files are proteced for security "
+                    "reasons, run the program again with `sudo`\n", 
+                    DEVICE_EVENT_PATH);
+            return 1;
+        }
+    } else if (device_count == 0) {
         fprintf(stderr, "No mouse devices found\n");
         fprintf(stderr, "Please check /proc/bus/input/devices file to see "
                 "if there are any mice available (if the cat hasn't eaten "
@@ -287,25 +387,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("%s is listening the following %d mice:\n", argv[0], mouse_count);
-    for (int i = 0; i < mouse_count; i++) {
+    printf("%s is listening the following %d devices:\n", 
+           argv[0], device_count);
+    for (int i = 0; i < device_count; i++) {
         printf("%s\n", smice.phy_devices[i].name);
     }
     printf("\n");
     printf("Press CTRL+C to safely quit the program\n");
 
     /* Grab control of the devices to hide them from the OS. */
-    for (int i = 0; i < mouse_count; i++) {
+    for (int i = 0; i < device_count; i++) {
         if (ioctl(smice.phy_devices[i].fd, EVIOCGRAB, 1) == -1) 
             perror("ioctl grab");
     }
 
-    /* Create virtual mice that mirrors the grabbed ones */
-    createVirtualMice(smice.vir_devices, mouse_count);
+    /* Create virtual mice that mirrors the physical grabbed ones */
+    createVirtualDevices(smice.vir_devices, smice.phy_devices, device_count);
 
     /* Event loop */
     while (running) {
-        int event_count = readEvents(smice.phy_devices, mouse_count, 
+        int event_count = readEvents(smice.phy_devices, device_count, 
                                      smice.event_buf, EVENT_BUFFER_SIZE);
         if (event_count < 0) break;
 
@@ -314,17 +415,17 @@ int main(int argc, char **argv) {
             int dev_index = smice.event_buf[e].dev_index;
             emitEvent(smice.vir_devices[dev_index].fd, &ie);
 
-            printf("dev:%d, time %ld.%06ld\ttype %d\tcode %d\tvalue %d\n",
+            printf("dev:%d  time %ld.%06ld  type %d  code %d  value %d\n",
                    dev_index, ie.time.tv_sec, ie.time.tv_usec, ie.type, 
                    ie.code, ie.value);
         }
     }
 
     /* Destroy virtual mice */
-    destroyVirtualMice(smice.vir_devices, mouse_count);
+    destroyVirtualMice(smice.vir_devices, device_count);
 
     /* Release control of the devices. */
-    for (int i = 0; i < mouse_count; i++) {
+    for (int i = 0; i < device_count; i++) {
         if (ioctl(smice.phy_devices[i].fd, EVIOCGRAB, 0) == -1) 
             perror("ioctl release");
     }
@@ -332,7 +433,7 @@ int main(int argc, char **argv) {
     printf("\n");
     printf("Input devices safely released\n");
 
-    for (int i = 0; i < mouse_count; i++) {
+    for (int i = 0; i < device_count; i++) {
         if (smice.phy_devices[i].fd != -1) {
             if (close(smice.phy_devices[i].fd) == -1) {
                 error(0, errno, "Failed to close file descriptor %d", 
