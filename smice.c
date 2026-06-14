@@ -28,9 +28,9 @@
 #define DEVICE_NAME_SIZE 128 /* Maximum number of character in a device name */
 #define EVENT_BUFFER_SIZE 64 /* Maximum number of events int the buffer */
 
-/* Represent the weight applied to a stream of data for the smoothing 
- * algorithm */
-#define SMOOTH_FACTOR 0.20
+/* Represent the default weight applied to a stream of data for the 
+ * smoothing algorithm */
+#define DEFAULT_SMOOTH_RATE 0.80
 
 /* Number of bits in a single unsigned long integer */
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
@@ -71,6 +71,9 @@ struct smice {
                       * position state */
     } device_pos[MAX_DEVICES];      /* Track the average history value of 
                                      * positions for each device */
+
+    float smooth_rate; /* [0.0,1.0] weight applied to the stream of data 
+                        * for the smoothing algorithm */
 } smice;
 
 static volatile int running = 1;
@@ -364,14 +367,80 @@ int emitEvent(struct dev *device, struct input_event *ie) {
 }
 
 /* Compute the Exponential Moving Average (EMA) of row data 'x' applied to 
- * the prevoius smoothing data series 's'. 
+ * the previous smoothing data series 's' with smoothing factor 'f'. 
  * Return the computed smoothed value. */
-double expSmooth(double x, double s) {
-    return SMOOTH_FACTOR * x + (1 - SMOOTH_FACTOR) * s;
+double expSmooth(double x, double s, float f) {
+    return f * x + (1 - f) * s;
+}
+
+/* Show the program usage. */
+void showUsage(const char *progname) {
+    printf("Usage: %s [OPTIONS...]\n\n"
+           "   -s FACTOR, --smooth-rate=FACTOR\n"
+           "          set the movement smoothing level.\n"
+           "          Must be a value between 0.0 and 1.0.\n"
+           "          An higher value means smoother behavior.\n"
+           "          (default: 0.80)\n\n"
+           "   -a ACTION_LIST, --actions=ACTION_LIST\n"
+           "          a comma-separated list of actions that trigger\n"
+           "          the smoothing effect. Available actions:\n"
+           "          'ALWAYS', 'LEFT-CLICK', 'RIGHT-CLICK',\n"
+           "          'MIDDLE-CLICK', 'TOUCH'\n"
+           "          (default: 'LEFT-CLICK')\n\n"
+           "   -h, --help  Display this help message and exit.\n\n",
+           progname);
 }
 
 int main(int argc, char **argv) {
-    (void)argc;
+    const char *progname = argv[0];
+
+    if (argc > 5) {
+        fprintf(stderr, "Too many argument for the program\n"
+                "Try `%s --help` for more information\n", progname);
+        return 1;
+    }
+
+    smice.smooth_rate = DEFAULT_SMOOTH_RATE;
+
+    /* Parse arguments */
+    for (int i = 1; i < argc; i++) {
+        int moreargs = (i+1) < argc;
+        if (strcmp(argv[i], "-s") == 0) {
+            if (!moreargs) {
+                fprintf(stderr, "%s option needs a value after him\n"
+                        "Try `%s --help` for more information\n",
+                        argv[i], progname);
+                return 1;
+            }
+
+            i++;
+            float smooth_rate = atof(argv[i]);
+            if (smooth_rate >= 0.0f && smooth_rate <= 1.0f)
+                smice.smooth_rate = smooth_rate;
+        }
+        else if (strncmp(argv[i], "--smooth-rate=", 14) == 0) {
+            if (strlen(argv[i]+14) == 0) {
+                fprintf(stderr, "%s argument needs a value\n"
+                        "Try `%s --help` for more information\n",
+                        argv[i], progname);
+                return 1;
+            }
+
+            float smooth_rate = atof(argv[i]+14);
+            if (smooth_rate >= 0.0f && smooth_rate <= 1.0f)
+                smice.smooth_rate = smooth_rate;
+        }
+        else if (strcmp(argv[i], "-h") == 0 ||
+                 strcmp(argv[i], "--help") == 0) {
+            showUsage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "%s: unrecognized option `%s`\n"
+                    "Try `%s --help` for more information\n", 
+                    progname, argv[i], progname);
+            return 1;
+        }
+    }
 
     /* Record termination signals to gracefully quit the event loop. */
     if (signal(SIGINT, sigHandler) == SIG_ERR) {
@@ -388,8 +457,13 @@ int main(int argc, char **argv) {
     if (device_count == -1) {
         if (errno == EACCES) {
             fprintf(stderr, "Since %s files are proteced for security "
-                    "reasons, run the program again with `sudo`\n", 
+                    "reasons, run the program again with sudo: `sudo ", 
                     DEVICE_EVENT_PATH);
+            for (int i = 0; i < argc; i++) {
+                printf("%s", argv[i]);
+                if (i < argc-1) printf(" ");
+            }
+            printf("`\n");
             return 1;
         }
     } else if (device_count == 0) {
@@ -444,13 +518,15 @@ int main(int argc, char **argv) {
             if (ie.type == EV_REL) {
                 if (ie.code == REL_X) {
                     int smooth_val = expSmooth(ie.value, 
-                                               smice.device_pos[dev_index].x);
+                                               smice.device_pos[dev_index].x,
+                                               1-smice.smooth_rate);
                     smice.device_pos[dev_index].x = smooth_val;
                     ie.value = smooth_val;
                 }
                 else if (ie.code == REL_Y) {
                     int smooth_val = expSmooth(ie.value, 
-                                               smice.device_pos[dev_index].y);
+                                               smice.device_pos[dev_index].y,
+                                               1-smice.smooth_rate);
                     smice.device_pos[dev_index].y = smooth_val;
                     ie.value = smooth_val;
                 }
@@ -469,7 +545,8 @@ int main(int argc, char **argv) {
                     }
 
                     int smooth_val = expSmooth(ie.value,
-                                               smice.device_pos[dev_index].x);
+                                               smice.device_pos[dev_index].x,
+                                               1-smice.smooth_rate);
                     smice.device_pos[dev_index].x = smooth_val;
                     ie.value = smooth_val;
                 }
@@ -485,7 +562,8 @@ int main(int argc, char **argv) {
                     }
 
                     int smooth_val = expSmooth(ie.value,
-                                               smice.device_pos[dev_index].y);
+                                               smice.device_pos[dev_index].y,
+                                               1-smice.smooth_rate);
                     smice.device_pos[dev_index].y = smooth_val;
                     ie.value = smooth_val;
                 }
