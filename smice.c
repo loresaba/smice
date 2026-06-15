@@ -32,6 +32,16 @@
  * smoothing algorithm */
 #define DEFAULT_SMOOTH_RATE 0.80
 
+/* Bitmask for activation actions */
+#define ACTION_ALWAYS       (1 << 0)
+#define ACTION_LEFT_CLICK   (1 << 1)
+#define ACTION_MIDDLE_CLICK (1 << 2)
+#define ACTION_RIGHT_CLICK  (1 << 3)
+#define ACTION_ON_TOUCH     (1 << 4)
+
+/* Return 1 if the action 'list' contains action 'action', 0 otherwise */
+#define HAS_ACTION(list, action) (((list) & (action)) != 0)
+
 /* Number of bits in a single unsigned long integer */
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
 
@@ -50,6 +60,7 @@ struct dev {
 
 /* Represent the state of the instance of the program. */
 struct smice {
+    const char *progname;                /* Null-term program name string */
     struct dev phy_devices[MAX_DEVICES]; /* File descriptors of physical
                                           * devices */
     struct dev vir_devices[MAX_DEVICES]; /* File descriptors of virtual
@@ -74,6 +85,8 @@ struct smice {
 
     float smooth_rate; /* [0.0,1.0] weight applied to the stream of data 
                         * for the smoothing algorithm */
+    uint32_t config_actions; /* Bitmap of user-selected trigger actions */
+    uint32_t active_actions; /* Bitmap of current trigger actions */
 } smice;
 
 static volatile int running = 1;
@@ -377,39 +390,82 @@ double expSmooth(double x, double s, float f) {
 void showUsage(const char *progname) {
     printf("Usage: %s [OPTIONS...]\n\n"
            "   -s FACTOR, --smooth-rate=FACTOR\n"
-           "          set the movement smoothing level.\n"
-           "          Must be a value between 0.0 and 1.0.\n"
-           "          An higher value means smoother behavior.\n"
+           "          set the movement smoothing level. Must be a value between\n"
+           "          0.0 and 1.0. An higher value produce a smoother behavior.\n"
            "          (default: 0.80)\n\n"
            "   -a ACTION_LIST, --actions=ACTION_LIST\n"
-           "          a comma-separated list of actions that trigger\n"
-           "          the smoothing effect. Available actions:\n"
+           "          a comma-separated list of actions that trigger the\n"
+           "          smoothing effect. Available actions:\n"
            "          'ALWAYS', 'LEFT-CLICK', 'RIGHT-CLICK',\n"
-           "          'MIDDLE-CLICK', 'TOUCH'\n"
+           "          'MIDDLE-CLICK', 'ON-TOUCH'\n"
            "          (default: 'LEFT-CLICK')\n\n"
+           "          Note that the 'LEFT-CLICK', 'RIGHT-CLICK', 'MIDDLE-CLICK'\n"
+           "          actions trigger on mice and on some trackpad devices.\n"
+           "          Instead the 'ON-TOUCH' action triggers on trackpads,\n"
+           "          tablets, etc.\n\n"
            "   -h, --help  Display this help message and exit.\n\n",
            progname);
 }
 
+/* Show the program help message on standard error. */
+void showHelp(void) {
+    fprintf(stderr, "Try `%s --help` for more information\n", smice.progname);
+}
+
+/* Parse comma-separated actions string.
+ * Return the computed action bitmask or 0 on error. */
+uint32_t parseActions(const char *str) {
+    uint32_t mask = 0;
+    char *actstr = strdup(str);
+    if (actstr == NULL) return 0;
+
+    char *tok = strtok(actstr, ",");
+    while (tok != NULL) {
+        if (strcmp(tok, "ALWAYS") == 0) {
+            mask |= ACTION_ALWAYS;
+        } else if (strcmp(tok, "LEFT-CLICK") == 0) {
+            mask |= ACTION_LEFT_CLICK;
+        } else if (strcmp(tok, "MIDDLE-CLICK") == 0) {
+            mask |= ACTION_MIDDLE_CLICK;
+        } else if (strcmp(tok, "RIGHT-CLICK") == 0) {
+            mask |= ACTION_RIGHT_CLICK;
+        } else if (strcmp(tok, "ON-TOUCH") == 0) {
+            mask |= ACTION_ON_TOUCH;
+        } else {
+            fprintf(stderr, "Unrecognized action trigger `%s`\n", tok);
+            showHelp();
+            mask = 0;
+            break;
+        }
+
+        tok = strtok(NULL, ",");
+    }
+
+    free(actstr);
+    return mask;
+}
+
 int main(int argc, char **argv) {
     const char *progname = argv[0];
+    smice.progname = progname;
 
     if (argc > 5) {
-        fprintf(stderr, "Too many argument for the program\n"
-                "Try `%s --help` for more information\n", progname);
+        fprintf(stderr, "Too many argument for the program\n");
+        showHelp();
         return 1;
     }
 
     smice.smooth_rate = DEFAULT_SMOOTH_RATE;
+    smice.config_actions = ACTION_LEFT_CLICK;
+    smice.active_actions = 0;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         int moreargs = (i+1) < argc;
         if (strcmp(argv[i], "-s") == 0) {
             if (!moreargs) {
-                fprintf(stderr, "%s option needs a value after him\n"
-                        "Try `%s --help` for more information\n",
-                        argv[i], progname);
+                fprintf(stderr, "%s option needs a value after it\n", argv[i]);
+                showHelp();
                 return 1;
             }
 
@@ -420,9 +476,8 @@ int main(int argc, char **argv) {
         }
         else if (strncmp(argv[i], "--smooth-rate=", 14) == 0) {
             if (strlen(argv[i]+14) == 0) {
-                fprintf(stderr, "%s argument needs a value\n"
-                        "Try `%s --help` for more information\n",
-                        argv[i], progname);
+                fprintf(stderr, "%s argument needs a value\n", argv[i]);
+                showHelp();
                 return 1;
             }
 
@@ -430,14 +485,39 @@ int main(int argc, char **argv) {
             if (smooth_rate >= 0.0f && smooth_rate <= 1.0f)
                 smice.smooth_rate = smooth_rate;
         }
+        else if (strcmp(argv[i], "-a") == 0) {
+            if (!moreargs) {
+                fprintf(stderr, "%s option needs a list of actions after it\n",
+                        argv[i]);
+                showHelp();
+                return 1;
+            }
+
+            i++;
+            uint32_t actions = parseActions(argv[i]);
+            if (actions == 0) return 1;
+            smice.config_actions = actions;
+        }
+        else if (strncmp(argv[i], "--actions=", 10) == 0) {
+            if (strlen(argv[i]+10) == 0) {
+                fprintf(stderr, "%s argument needs a list of actions\n", 
+                        argv[i]);
+                showHelp();
+                return 1;
+            }
+
+            uint32_t actions = parseActions(argv[i] + 10);
+            if (actions == 0) return 1;
+            smice.config_actions = actions;
+        }
         else if (strcmp(argv[i], "-h") == 0 ||
                  strcmp(argv[i], "--help") == 0) {
             showUsage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "%s: unrecognized option `%s`\n"
-                    "Try `%s --help` for more information\n", 
-                    progname, argv[i], progname);
+            fprintf(stderr, "%s: unrecognized option `%s`\n", 
+                    progname, argv[i]);
+            showHelp();
             return 1;
         }
     }
@@ -474,6 +554,32 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    printf("Smooth rate:     %.3f\n",   smice.smooth_rate);
+    printf("Trigger actions: [");
+    uint32_t actions = smice.config_actions;
+    while (actions != 0) {
+        if (HAS_ACTION(actions, ACTION_ALWAYS)) {
+            printf("ALWAYS");
+            actions &= ~ACTION_ALWAYS;
+        } else if (HAS_ACTION(actions, ACTION_LEFT_CLICK)) {
+            printf("LEFT-CLICK");
+            actions &= ~ACTION_LEFT_CLICK;
+        } else if (HAS_ACTION(actions, ACTION_MIDDLE_CLICK)) {
+            printf("MIDDLE-CLICK");
+            actions &= ~ACTION_MIDDLE_CLICK;
+        } else if (HAS_ACTION(actions, ACTION_RIGHT_CLICK)) {
+            printf("RIGHT-CLICK");
+            actions &= ~ACTION_RIGHT_CLICK;
+        } else if (HAS_ACTION(actions, ACTION_ON_TOUCH)) {
+            printf("ON-TOUCH");
+            actions &= ~ACTION_ON_TOUCH;
+        }
+
+        if (actions != 0) printf(", ");
+    }
+    printf("]\n");
+
+    printf("\n");
     printf("%s is listening the following %d devices:\n", 
            argv[0], device_count);
     for (int i = 0; i < device_count; i++) {
@@ -506,66 +612,96 @@ int main(int argc, char **argv) {
             struct input_event ie = smice.event_buf[e].event;
             int dev_index = smice.event_buf[e].dev_index;
 
-            /* Catch finger/pen lift-off events to reset absolute
-             * initialization state */
-            if (ie.type == EV_KEY && ie.code == BTN_TOUCH) {
-                if (ie.value == 0) {
+            /* Track current trigger actions states */
+            if (ie.type == EV_KEY) {
+                int button_flag = 0;
+                if (ie.code == BTN_LEFT)   button_flag = ACTION_LEFT_CLICK;
+                if (ie.code == BTN_MIDDLE) button_flag = ACTION_MIDDLE_CLICK;
+                if (ie.code == BTN_RIGHT)  button_flag = ACTION_RIGHT_CLICK;
+                if (ie.code == BTN_TOUCH)  button_flag = ACTION_ON_TOUCH;
+
+                if (button_flag != 0) {
+                    if (ie.value != 0) /* button pressed */
+                        smice.active_actions |= button_flag;
+                    else               /* button released */
+                        smice.active_actions &= ~button_flag;
+                }
+
+                /* Catch finger/pen lift-off events to reset absolute
+                 * initialization state */
+                if (ie.code == BTN_TOUCH && ie.value == 0) {
                     smice.device_pos[dev_index].is_init = 0;
                 }
             }
 
+            int is_smooth_active = 
+                HAS_ACTION(smice.config_actions, ACTION_ALWAYS) ||
+                HAS_ACTION(smice.config_actions, smice.active_actions);
+
             /* Smooth relative mouse pointer movements */
             if (ie.type == EV_REL) {
-                if (ie.code == REL_X) {
-                    int smooth_val = expSmooth(ie.value, 
-                                               smice.device_pos[dev_index].x,
-                                               1-smice.smooth_rate);
-                    smice.device_pos[dev_index].x = smooth_val;
-                    ie.value = smooth_val;
-                }
-                else if (ie.code == REL_Y) {
-                    int smooth_val = expSmooth(ie.value, 
-                                               smice.device_pos[dev_index].y,
-                                               1-smice.smooth_rate);
-                    smice.device_pos[dev_index].y = smooth_val;
-                    ie.value = smooth_val;
+                if (is_smooth_active) {
+                    if (ie.code == REL_X) {
+                        int smooth_val = expSmooth(ie.value, 
+                                smice.device_pos[dev_index].x,
+                                1-smice.smooth_rate);
+                        smice.device_pos[dev_index].x = smooth_val;
+                        ie.value = smooth_val;
+                    }
+                    else if (ie.code == REL_Y) {
+                        int smooth_val = expSmooth(ie.value, 
+                                smice.device_pos[dev_index].y,
+                                1-smice.smooth_rate);
+                        smice.device_pos[dev_index].y = smooth_val;
+                        ie.value = smooth_val;
+                    }
+                } else {
+                    if (ie.code == REL_X) smice.device_pos[dev_index].x = 0;
+                    if (ie.code == REL_Y) smice.device_pos[dev_index].y = 0;
                 }
             }
             /* Smooth absolute pointer movements */
             else if (ie.type == EV_ABS) {
-                if (ie.code == ABS_X) {
-                    int curr_pos = smice.device_pos[dev_index].x;
+                if (is_smooth_active) {
+                    if (ie.code == ABS_X) {
+                        int curr_pos = smice.device_pos[dev_index].x;
 
-                    /* Initialize or handle massive jumps */
-                    double diff = (ie.value > curr_pos) ? 
-                        (ie.value - curr_pos) : (curr_pos - ie.value);
-                    if (!smice.device_pos[dev_index].is_init || 
-                        diff > 1000.0) {
+                        /* Initialize or handle massive jumps */
+                        double diff = (ie.value > curr_pos) ? 
+                            (ie.value - curr_pos) : (curr_pos - ie.value);
+                        if (!smice.device_pos[dev_index].is_init || 
+                                diff > 1000.0) {
+                            smice.device_pos[dev_index].x = ie.value;
+                        }
+
+                        int smooth_val = expSmooth(ie.value,
+                                smice.device_pos[dev_index].x,
+                                1-smice.smooth_rate);
+                        smice.device_pos[dev_index].x = smooth_val;
+                        ie.value = smooth_val;
+                    }
+                    else if (ie.code == ABS_Y) {
+                        int curr_pos = smice.device_pos[dev_index].y;
+
+                        /* Initialize or handle massive jumps */
+                        double diff = (ie.value > curr_pos) ? 
+                            (ie.value - curr_pos) : (curr_pos - ie.value);
+                        if (!smice.device_pos[dev_index].is_init || 
+                                diff > 1000.0) {
+                            smice.device_pos[dev_index].y = ie.value;
+                        }
+
+                        int smooth_val = expSmooth(ie.value,
+                                smice.device_pos[dev_index].y,
+                                1-smice.smooth_rate);
+                        smice.device_pos[dev_index].y = smooth_val;
+                        ie.value = smooth_val;
+                    }
+                } else {
+                    if (ie.code == ABS_X) 
                         smice.device_pos[dev_index].x = ie.value;
-                    }
-
-                    int smooth_val = expSmooth(ie.value,
-                                               smice.device_pos[dev_index].x,
-                                               1-smice.smooth_rate);
-                    smice.device_pos[dev_index].x = smooth_val;
-                    ie.value = smooth_val;
-                }
-                else if (ie.code == ABS_Y) {
-                    int curr_pos = smice.device_pos[dev_index].y;
-
-                    /* Initialize or handle massive jumps */
-                    double diff = (ie.value > curr_pos) ? 
-                        (ie.value - curr_pos) : (curr_pos - ie.value);
-                    if (!smice.device_pos[dev_index].is_init || 
-                        diff > 1000.0) {
+                    if (ie.code == ABS_Y) 
                         smice.device_pos[dev_index].y = ie.value;
-                    }
-
-                    int smooth_val = expSmooth(ie.value,
-                                               smice.device_pos[dev_index].y,
-                                               1-smice.smooth_rate);
-                    smice.device_pos[dev_index].y = smooth_val;
-                    ie.value = smooth_val;
                 }
             }
             else if (ie.type == EV_SYN && ie.code == SYN_REPORT) {
@@ -575,10 +711,6 @@ int main(int argc, char **argv) {
             }
 
             emitEvent(&smice.vir_devices[dev_index], &ie);
-
-            printf("dev:%d  time %ld.%06ld  type %d  code %d  value %d\n",
-                   dev_index, ie.time.tv_sec, ie.time.tv_usec, ie.type, 
-                   ie.code, ie.value);
         }
     }
 
