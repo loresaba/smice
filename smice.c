@@ -22,6 +22,23 @@
  * IN THE SOFTWARE.
  */
 
+#if !defined(__linux__)
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+#if defined(_WIN32) || defined(_WIN64)
+    fprintf(stderr, "Error: Windows is not supported. To help port it, visit github.com/loresaba/smice\n");
+#elif defined(__APPLE__) || defined(__MACH__)
+    fprintf(stderr, "Error: macOS is not supported. To help port it, visit github.com/loresaba/smice\n");
+#else
+    fprintf(stderr, "Error: Unsupported operating system. To help port it, visit github.com/loresaba/smice\n");
+#endif
+    return 1;
+}
+#else
+
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
@@ -767,3 +784,5 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+
+#endif
